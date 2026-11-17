@@ -24,6 +24,10 @@ use rustel_fraction::Fraction;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod tempo;
+
+use tempo::TempoMap;
+
 /// Monotonically increasing id for a pattern generation. Bumped on every
 /// evaluation; events from older generations are never delivered.
 pub type Generation = u64;
@@ -50,6 +54,9 @@ pub struct Event {
     pub duration: Fraction,
     /// Wall-clock seconds at which it should sound.
     pub target_time: f64,
+    /// The tempo, in cycles per second, that a pattern set for this onset.
+    /// `None` when the onset plays at the session tempo.
+    pub cps: Option<f64>,
     pub value: Value,
     /// Direct gain, cutoff and resonance slider tokens. Zero means unbound.
     pub live_controls: [u64; 4],
@@ -504,15 +511,18 @@ pub struct Scheduler {
     horizon: f64,
     /// Maximum haps one query may materialise before the scheduler refuses it.
     query_hap_budget: u64,
-    cps: f64,
+    /// Where each cycle is on the clock.
+    tempo: TempoMap,
+    /// Whether a hap's `cps` control changes the tempo. An outside clock
+    /// that owns the tempo turns this off.
+    pattern_tempo: bool,
+    /// A fill changed the tempo, so the horizon it covered can be short.
+    tempo_changed: bool,
     /// Cycle position already queried up to.
     queried_to: Fraction,
     /// Explicit transport starts exclude earlier cycles, even if a control
     /// re-query occurs during preroll. Unset for an unrestricted timeline.
     query_start: Option<Fraction>,
-    /// Wall-clock time corresponding to `queried_to`.
-    anchor_time: f64,
-    anchor_cycle: Fraction,
     queue: Vec<Event>,
     /// The message from the most recent query that threw, if any.
     ///
@@ -671,6 +681,32 @@ const MOVED_PAIRS_LIMIT: usize = 4_096;
 /// one sound this near are one doubled voice to the ear.
 const SAME_INSTANT_SECS: f64 = 1e-3;
 
+/// The most fills one tick makes. A faster tempo can leave the horizon
+/// short after a fill, so the tick fills again.
+const MAX_FILLS_PER_TICK: usize = 8;
+
+/// The tempo a hap value asks for with its `cps` control: a finite number
+/// above zero.
+fn hap_tempo(value: &Value) -> Option<f64> {
+    value
+        .get("cps")?
+        .as_f64()
+        .filter(|cps| cps.is_finite() && *cps > 0.0)
+}
+
+/// Put haps in onset order, and a tempo change first among the onsets of
+/// one cycle, so each onset is timed at the tempo in force at it. The sort
+/// is stable.
+fn sort_for_tempo(haps: &mut [Hap]) {
+    let begin = |hap: &Hap| hap.whole.map_or(hap.part.begin, |whole| whole.begin);
+    haps.sort_by(|a, b| {
+        begin(a).cmp(&begin(b)).then_with(|| {
+            let changes = |hap: &Hap| hap_tempo(&hap.value).is_some();
+            changes(b).cmp(&changes(a))
+        })
+    });
+}
+
 /// The largest phase move, in cycles, that [`Scheduler::retime`] reads as
 /// rounding. A clock bend passes the cycle at its instant back unchanged.
 const RETIME_BEND_CYCLES: f64 = 1e-9;
@@ -697,11 +733,11 @@ impl Scheduler {
             transport,
             horizon,
             query_hap_budget: rustel_core::DEFAULT_HAP_BUDGET,
-            cps,
+            tempo: TempoMap::new(cps),
+            pattern_tempo: true,
+            tempo_changed: false,
             queried_to: Fraction::ZERO,
             query_start: None,
-            anchor_time: 0.0,
-            anchor_cycle: Fraction::ZERO,
             queue: Vec::new(),
             refused: None,
             thrown: None,
@@ -803,8 +839,9 @@ impl Scheduler {
         // A fill ends at most one horizon past its clock, so the playhead sits
         // within `lead` cycles of this frontier. The clamp keeps a huge
         // horizon inside the cycle arithmetic.
-        let lead = if self.cps.is_finite() && self.cps > 0.0 {
-            (self.horizon * self.cps).ceil().clamp(0.0, 1.0e9) as i128
+        let cps = self.tempo.cps();
+        let lead = if cps.is_finite() && cps > 0.0 {
+            (self.horizon * cps).ceil().clamp(0.0, 1.0e9) as i128
         } else {
             0
         };
@@ -883,15 +920,14 @@ impl Scheduler {
                 "replacement cps must be finite and greater than zero"
             );
             if cps.is_finite() && cps > 0.0 {
-                self.cps = cps;
+                self.tempo.set_cps(cps);
             }
         }
         let generation = self.transport.bump();
         self.pattern = Some(pattern);
         // Re-anchor so the new generation continues from the current time
         // rather than replaying the old one's cycle positions.
-        self.anchor_time = now;
-        self.anchor_cycle = self.queried_to;
+        self.tempo.reanchor(now, self.queried_to);
         self.queue.clear();
         self.forget_device_copies();
         self.clear_trace();
@@ -929,8 +965,7 @@ impl Scheduler {
         let anchor_cycle = Fraction::from_f64(self.cycle_at_time(now))?;
         let cursor_cycle = Fraction::from_f64(self.cycle_at_time(cursor_time))?;
         let generation = self.transport.bump();
-        self.anchor_time = now;
-        self.anchor_cycle = anchor_cycle;
+        self.tempo.reanchor(now, anchor_cycle);
         self.queried_to = self.at_or_after_start(cursor_cycle.max(anchor_cycle));
         self.queue.clear();
         self.forget_device_copies();
@@ -977,7 +1012,7 @@ impl Scheduler {
     pub fn requery_active_from(&mut self, now: f64, takeover_edge: f64) -> Option<Generation> {
         // Read before `requery_active` moves the anchor.
         let mut cursor = self.cycle_at_or_after_time(takeover_edge)?;
-        let (anchor_time, anchor_cycle) = (self.anchor_time, self.anchor_cycle);
+        let tempo = self.tempo.clone();
         let retimed = self.retimed;
         let emitted = std::mem::take(&mut self.emitted);
         let superseded = std::mem::take(&mut self.superseded);
@@ -1008,8 +1043,7 @@ impl Scheduler {
             cursor = cursor.min(first);
         }
         if cursor > self.queried_to {
-            self.anchor_time = anchor_time;
-            self.anchor_cycle = anchor_cycle;
+            self.tempo = tempo;
             self.queried_to = cursor;
         }
         let held = self.carry_device_copies(generation, kept, self.queried_to, false);
@@ -1111,19 +1145,35 @@ impl Scheduler {
             .chain(std::mem::take(&mut self.superseded))
     }
 
-    /// The rate used for query controls and cycle-to-wall-clock conversion.
+    /// The tempo that plays, as of the last tick: the session tempo, or
+    /// one a pattern set since.
     pub fn cps(&self) -> f64 {
-        self.cps
+        self.tempo.cps()
+    }
+
+    /// Whether a hap's `cps` control changes the tempo.
+    pub fn pattern_tempo(&self) -> bool {
+        self.pattern_tempo
+    }
+
+    /// Let a hap's `cps` control change the tempo, or not. Turning it off
+    /// keeps the tempo that plays and drops each change still ahead.
+    pub fn set_pattern_tempo(&mut self, enabled: bool) {
+        if !enabled {
+            let cps = self.tempo.cps();
+            self.tempo.set_cps(cps);
+        }
+        self.pattern_tempo = enabled;
     }
 
     /// Wall-clock time of `cycle` under the current anchor.
     pub fn time_at_cycle(&self, cycle: Fraction) -> f64 {
-        self.anchor_time + cycle.sub(self.anchor_cycle).to_f64() / self.cps
+        self.tempo.time_at_cycle(cycle)
     }
 
     /// Inverse of [`Self::time_at_cycle`], as an f64 cycle position.
     pub fn cycle_at_time(&self, time: f64) -> f64 {
-        self.anchor_cycle.to_f64() + (time - self.anchor_time) * self.cps
+        self.tempo.cycle_at_time(time)
     }
 
     /// The query cursor for `time`: the nearest cycle position
@@ -1166,9 +1216,7 @@ impl Scheduler {
         let Some(cycle) = Fraction::from_f64(cycle) else {
             return;
         };
-        self.cps = cps;
-        self.anchor_time = now;
-        self.anchor_cycle = cycle;
+        self.tempo.retime(now, cycle, cps);
         self.retimed |= jump;
         // An outside clock owns its cycle domain, including negative cycles.
         self.query_start = None;
@@ -1218,8 +1266,7 @@ impl Scheduler {
         else {
             return;
         };
-        self.anchor_time = now;
-        self.anchor_cycle = cycle;
+        self.tempo.reanchor(now, cycle);
         self.queried_to = self.at_or_after_start(cursor.max(cycle));
         self.last_fill_time = now;
     }
@@ -1234,11 +1281,10 @@ impl Scheduler {
         let Some(cycle) = Fraction::from_f64(cycle) else {
             return;
         };
-        let anchor = (self.anchor_time, self.anchor_cycle);
-        self.anchor_time = now;
-        self.anchor_cycle = cycle;
+        let tempo = self.tempo.clone();
+        self.tempo.reanchor(now, cycle);
         let Some(cursor) = self.cycle_at_or_after_time(takeover_edge) else {
-            (self.anchor_time, self.anchor_cycle) = anchor;
+            self.tempo = tempo;
             return;
         };
         self.queried_to = self.at_or_after_start(cursor.max(cycle));
@@ -1745,7 +1791,7 @@ impl Scheduler {
 
     /// Wall-clock time up to which the pattern has been queried.
     fn scheduled_to(&self) -> f64 {
-        self.anchor_time + self.queried_to.sub(self.anchor_cycle).to_f64() / self.cps
+        self.tempo.time_at_cycle(self.queried_to)
     }
 
     /// Seconds of schedule still buffered ahead of `now` - the real bound on
@@ -1851,6 +1897,33 @@ impl Scheduler {
         &mut self,
         clock: &dyn Clock,
         max_span_cycles: f64,
+        profile: Option<&mut SchedulerTickProfile>,
+    ) -> TickStatus {
+        self.tempo.advance(clock.now());
+        let status = self.fill(clock, max_span_cycles, profile);
+        // A faster tempo leaves less time in the cycles a fill covered.
+        // Fill again until the horizon is covered.
+        let mut fills = 1;
+        while status == TickStatus::Filled
+            && std::mem::take(&mut self.tempo_changed)
+            && fills < MAX_FILLS_PER_TICK
+        {
+            fills += 1;
+            match self.fill(clock, max_span_cycles, None) {
+                TickStatus::Filled | TickStatus::HorizonFull => {}
+                other => return other,
+            }
+        }
+        self.tempo_changed = false;
+        status
+    }
+
+    /// Query the pattern once, from the cursor, for the time the horizon
+    /// lacks.
+    fn fill(
+        &mut self,
+        clock: &dyn Clock,
+        max_span_cycles: f64,
         mut profile: Option<&mut SchedulerTickProfile>,
     ) -> TickStatus {
         if self.transport.is_stopped() {
@@ -1893,8 +1966,11 @@ impl Scheduler {
         } else {
             MAX_TICK_SPAN_CYCLES
         };
-        let cycles_needed =
-            ((target_time - self.scheduled_to()) * self.cps).clamp(0.0, max_span_cycles);
+        // The query finds again each tempo change from the cursor on.
+        self.tempo.forget_from(self.queried_to);
+        let cycles_needed = ((target_time - self.scheduled_to())
+            * self.tempo.cps_at_cycle(self.queried_to))
+        .clamp(0.0, max_span_cycles);
         // Quantize to whole millicycles so query windows stay exact rationals
         // over 1000. Truncation normally leaves a small deficit for the next tick.
         //
@@ -1926,7 +2002,9 @@ impl Scheduler {
         let mut state = State::new(TimeSpan::new(begin, end));
         // `_cps` marks this as a real trigger query, which `glide`-style
         // patterns read to distinguish it from a lookahead.
-        state.controls.push(("_cps".into(), Value::F64(self.cps)));
+        state
+            .controls
+            .push(("_cps".into(), Value::F64(self.tempo.cps_at_cycle(begin))));
         // Apply the top-level query error boundary: thrown queries produce
         // no onsets, while resource refusals remain distinct from silence so
         // callers can retry or report an incomplete render.
@@ -1947,7 +2025,7 @@ impl Scheduler {
             profile.callback_kind_sample = callback.kind_sample();
             profile.callback_nanos = callback.busy_nanos();
         }
-        let haps: Vec<Hap> = match query {
+        let mut haps: Vec<Hap> = match query {
             Ok(rustel_core::QueryArcOutcome::Haps(haps)) => haps,
             // The `queryArc` catch: this window is silent, and the throw is
             // kept so somebody can say why.
@@ -1989,6 +2067,15 @@ impl Scheduler {
         let mut queue_full = false;
         // Earliest onset the cap left unqueued; the cursor stops there.
         let mut unprocessed_begin: Option<Fraction> = None;
+        // A tempo change times the onsets after it, so they come in order.
+        let has_tempo = self.pattern_tempo
+            && haps
+                .iter()
+                .any(|hap| hap.has_onset() && hap_tempo(&hap.value).is_some());
+        if has_tempo {
+            sort_for_tempo(&mut haps);
+        }
+        let mut tempo_changed = false;
         // Inside a continued replacement's takeover window: the changed or
         // moved haps the device's outgoing copies stand in for.
         let mut stand_ins = self.overlap_stand_ins(&haps, generation, end);
@@ -2016,6 +2103,16 @@ impl Scheduler {
                 continue;
             }
             let Some(whole) = hap.whole else { continue };
+            let target_time = self.tempo.time_at_cycle(whole.begin);
+            // After a slower tempo, an onset past the horizon waits for a
+            // later fill. The cursor stops at it.
+            if tempo_changed && target_time > now + self.horizon {
+                unprocessed_begin = Some(whole.begin);
+                break;
+            }
+            if has_tempo && let Some(cps) = hap_tempo(&hap.value) {
+                tempo_changed |= self.tempo.change_at(whole.begin, cps);
+            }
             let value_show = hap.value.show();
             let mut key = EmittedKey {
                 generation,
@@ -2027,8 +2124,6 @@ impl Scheduler {
             let occurrence = self.pass_ordinals.entry(key.clone()).or_insert(0);
             key.occurrence = *occurrence;
             *occurrence += 1;
-            let cycles_from_anchor = whole.begin.sub(self.anchor_cycle).to_f64();
-            let target_time = self.anchor_time + cycles_from_anchor / self.cps;
             if let Some((copy_begin, copy)) = stand_ins.remove(&at) {
                 // The device plays an outgoing copy in this hap's place until
                 // the takeover. The copy is spent and the hap counts as
@@ -2086,6 +2181,7 @@ impl Scheduler {
                 whole_end: whole.end,
                 duration,
                 target_time,
+                cps: self.tempo.pattern_cps_at(whole.begin),
                 value: hap.value,
                 live_controls: hap.live_controls,
                 ui_visuals,
@@ -2110,6 +2206,7 @@ impl Scheduler {
             }
         }
         self.clear_pass_ordinals();
+        self.tempo_changed |= tempo_changed;
         // The cursor advances only past onsets this fill queued, so a
         // queue-full fill resumes at its earliest unqueued onset; the `emitted`
         // keys keep the retry from queueing an onset twice.
@@ -2532,6 +2629,7 @@ mod tests {
                 whole_end: Fraction::ONE,
                 duration: Fraction::ONE,
                 target_time: 0.50,
+                cps: None,
                 value: Value::Str("late".into()),
                 live_controls: [0; 4],
                 ui_visuals: 0,
@@ -2544,6 +2642,7 @@ mod tests {
                 whole_end: Fraction::ONE,
                 duration: Fraction::ONE,
                 target_time: 0.25,
+                cps: None,
                 value: Value::Str("early".into()),
                 live_controls: [0; 4],
                 ui_visuals: 0,
@@ -2566,6 +2665,7 @@ mod tests {
             whole_end: Fraction::ONE,
             duration: Fraction::ONE,
             target_time: f64::NAN,
+            cps: None,
             value: Value::Str("nan".into()),
             live_controls: [0; 4],
             ui_visuals: 0,
@@ -2617,6 +2717,7 @@ mod tests {
             whole_end: Fraction::ONE,
             duration: Fraction::ONE,
             target_time,
+            cps: None,
             value: Value::object([
                 ("s".into(), Value::Str(name.into())),
                 ("gain".into(), Value::F64(0.5)),
@@ -2821,7 +2922,7 @@ mod tests {
         assert!(scheduler.time_at_cycle(scheduler.queried_to) >= edge);
         assert!(scheduler.scheduled_to_cycle() - 0.5 < 1e-6);
         assert_eq!(
-            (scheduler.anchor_time, scheduler.anchor_cycle),
+            scheduler.tempo.anchor(),
             (0.0, Fraction::ZERO),
             "the mapping stays on its anchor"
         );
@@ -2999,10 +3100,7 @@ mod tests {
     fn a_rebase_from_an_edge_starts_the_cursor_on_it() {
         let (mut scheduler, _clock) = quarter_grid();
         scheduler.rebase_anchor_from(0.3, 0.3, 0.5 + 1e-6 / 48_000.0);
-        assert_eq!(
-            (scheduler.anchor_time, scheduler.anchor_cycle),
-            (0.3, Fraction::new(3, 10))
-        );
+        assert_eq!(scheduler.tempo.anchor(), (0.3, Fraction::new(3, 10)));
         assert!(scheduler.queried_to > Fraction::new(1, 2));
         assert!(scheduler.scheduled_to_cycle() - 0.5 < 1e-6);
 
@@ -3013,21 +3111,10 @@ mod tests {
         scheduler.rebase_anchor_from(0.6, 0.6, 0.1);
         assert_eq!(scheduler.scheduled_to_cycle(), 0.6);
 
-        let before = (
-            scheduler.anchor_time,
-            scheduler.anchor_cycle,
-            scheduler.queried_to,
-        );
+        let before = (scheduler.tempo.anchor(), scheduler.queried_to);
         scheduler.rebase_anchor_from(0.7, 0.7, f64::NAN);
         scheduler.rebase_anchor_from(0.7, f64::NAN, 0.9);
-        assert_eq!(
-            (
-                scheduler.anchor_time,
-                scheduler.anchor_cycle,
-                scheduler.queried_to
-            ),
-            before
-        );
+        assert_eq!((scheduler.tempo.anchor(), scheduler.queried_to), before);
     }
 
     /// A rewind's first window held for a loading sample is reopened, not

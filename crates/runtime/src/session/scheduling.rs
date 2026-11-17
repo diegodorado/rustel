@@ -198,6 +198,7 @@ impl Session {
                     whole_begin: whole_begin.show(),
                     duration_secs,
                     target_time: self.time_at_cycle(whole_begin),
+                    cps: None,
                     value: ValueJson::from_value(&hap.value),
                     value_show: String::new(),
                     ui_visuals: hap.ui_visuals_context(),
@@ -237,6 +238,16 @@ impl Session {
     pub fn retime(&mut self, now: f64, cps: f64, cycle: f64) {
         self.scheduler.retime(now, cps, cycle);
         self.config.cps = self.scheduler.cps();
+    }
+
+    /// Let a pattern's `cps` control change the tempo, or not. An outside
+    /// clock that owns the tempo turns it off, and the tempo that plays
+    /// becomes the session tempo.
+    pub fn set_pattern_tempo(&mut self, enabled: bool) {
+        self.scheduler.set_pattern_tempo(enabled);
+        if !enabled {
+            self.config.cps = self.scheduler.cps();
+        }
     }
 
     /// Make the next live reload take over at `time` (device seconds):
@@ -812,8 +823,9 @@ impl Session {
                 onset_id: event.onset_id,
                 generation: event.generation,
                 whole_begin: event.whole_begin.show(),
-                duration_secs: event.duration.to_f64() / cps,
+                duration_secs: event.duration.to_f64() / event.cps.unwrap_or(cps),
                 target_time: event.target_time,
+                cps: event.cps,
                 value: ValueJson::from_value(&event.value),
                 value_show: event.value.show(),
                 live_controls: event.live_controls,
