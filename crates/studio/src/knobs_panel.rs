@@ -26,6 +26,9 @@ pub const KNOBS_WIDTH: u16 = 26;
 /// The least rows the column draws: a title, a rail, and two hint rows.
 pub const KNOBS_HEIGHT: u16 = 6;
 
+/// The word a rail that waits for an update carries beside its reading.
+const WAITS_TAG: &str = "not live";
+
 /// The rows one knob takes: its name and reading, then its rail.
 const KNOB_ROWS: u16 = 2;
 
@@ -63,6 +66,10 @@ pub struct Knob {
     /// A frequency control on a positive range, as the inline sliders
     /// decide it, so the rail travels the way the ear hears it.
     pub log: bool,
+    /// The set plays, and a move is not heard until the next update: the
+    /// playing score does not hold this number yet, or holds it where no
+    /// live cell can stand. Drawn muted, on a dashed rail.
+    pub waits: bool,
 }
 
 impl Knob {
@@ -199,6 +206,9 @@ pub struct HeldOff {
     /// call still reads as it was left, the entry goes back exactly as
     /// it was: its place, its comments, its fader.
     pub text: Option<HeldText>,
+    /// Where the playing score holds the number, as of the evaluation at
+    /// that revision: back on, the rail moves that number live again.
+    pub playing: Option<(Revision, Range<usize>)>,
 }
 
 /// What came out of a call with an entry the hand took off, to put back.
@@ -431,6 +441,8 @@ pub struct KnobsData<'a> {
     /// The presets of the plugin call, under the rails.
     pub presets: Option<PresetsSection<'a>>,
     pub panel: &'a KnobsPanel,
+    /// The fine lock is on: every rail drag moves a tenth as far.
+    pub fine_lock: bool,
 }
 
 /// The panel as the painter draws it. The reading is each frame's own. The
@@ -445,6 +457,8 @@ pub struct KnobsView<'a> {
     /// The presets of the plugin call, under the rails.
     pub presets: Option<PresetsSection<'a>>,
     pub panel: &'a KnobsPanel,
+    /// The fine lock is on: the title says so.
+    pub fine_lock: bool,
     pub theme: &'a Theme,
     pub focused: bool,
     pub area: Rect,
@@ -467,10 +481,13 @@ impl Widget for KnobsView<'_> {
         }
         // The call the rails belong to, always: the accent while the
         // column has the keys, muted while the score has them.
-        let title = match self.name {
+        let mut title = match self.name {
             Some(name) => format!("knobs · {name}"),
             None => "knobs".to_owned(),
         };
+        if self.fine_lock {
+            title.push_str(" · fine");
+        }
         let title_style = if self.focused {
             Style::default()
                 .fg(theme.accent)
@@ -585,9 +602,11 @@ impl KnobsView<'_> {
             Some(0) => "→ opens the presets",
             Some(_) => "Enter takes · ← closes",
             None => match self.knobs.get(self.panel.selected) {
-                Some(knob) if knob.optional && knob.state.is_none() => "→ on · Enter edit",
-                Some(knob) if knob.optional => "⌫ off · Enter edit",
-                Some(_) => "←/→ move · Enter edit",
+                Some(knob) if knob.waits && knob.optional => "⌫ off · plays on update",
+                Some(knob) if knob.waits => "plays after an update",
+                Some(knob) if knob.optional && knob.state.is_none() => "→ on · e edit · f fine",
+                Some(knob) if knob.optional => "⌫ off · e edit · f fine",
+                Some(_) => "←/→ · e edit · f fine",
                 None => "",
             },
         };
@@ -667,7 +686,7 @@ impl KnobsView<'_> {
         chosen: bool,
     ) {
         let theme = self.theme;
-        let on = knob.state.is_some();
+        let on = knob.state.is_some() && !knob.waits;
         let reading = match &knob.state {
             Some(state) => short_number(state.value),
             None => "off".to_owned(),
@@ -696,6 +715,19 @@ impl KnobsView<'_> {
             usize::from(area.right() - x),
             style(if on { theme.accent } else { theme.muted }),
         );
+        // A rail that waits for an update says so between its name and its
+        // reading, where the row has room for the word.
+        let label = knob.label.chars().count() as u16;
+        let tag_x = x.saturating_sub(WAITS_TAG.len() as u16 + 1);
+        if knob.waits && tag_x > area.x + label {
+            buffer.set_stringn(
+                tag_x,
+                area.y,
+                WAITS_TAG,
+                WAITS_TAG.len(),
+                style(theme.muted).add_modifier(Modifier::ITALIC),
+            );
+        }
     }
 
     fn draw_rail(
@@ -717,11 +749,13 @@ impl KnobsView<'_> {
             // says so at a glance, the way a dimmed light does.
             if knob.optional && position == 0 {
                 text.push(if notch.is_none() { '█' } else { '·' });
+            } else if position == handle {
+                text.push('█');
             } else {
-                text.push(if position == handle { '█' } else { '─' });
+                text.push(if knob.waits { '╌' } else { '─' });
             }
         }
-        let mut style = Style::default().fg(if notch.is_some() {
+        let mut style = Style::default().fg(if notch.is_some() && !knob.waits {
             theme.accent
         } else {
             theme.muted
@@ -892,6 +926,56 @@ mod tests {
         assert_eq!(knob_at(body(), 0, 9, 6), None, "outside the body");
     }
 
+    /// A rail that waits for an update says "not live" beside its reading,
+    /// on a dashed rail. A live rail says neither. The title says when the
+    /// fine lock is on.
+    #[test]
+    fn a_waiting_rail_says_it_is_not_live() {
+        let knob = |waits| Knob {
+            label: "segments".into(),
+            place: KnobPlace::Argument(0),
+            state: Some(KnobState {
+                literal: 0..1,
+                fader: None,
+                value: 8.0,
+            }),
+            min: 1.0,
+            max: 16.0,
+            step: 1.0,
+            default: 8.0,
+            optional: false,
+            log: false,
+            waits,
+        };
+        let theme = Theme::default();
+        let panel = KnobsPanel::default();
+        let area = Rect::new(0, 0, KNOBS_WIDTH, 12);
+        for waits in [true, false] {
+            let knobs = [knob(waits)];
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            KnobsView {
+                name: Some("seg"),
+                listed: false,
+                knobs: &knobs,
+                presets: None,
+                panel: &panel,
+                fine_lock: waits,
+                theme: &theme,
+                focused: false,
+                area,
+            }
+            .render(area, &mut buffer);
+            let row = |y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            };
+            assert_eq!(row(1).contains("not live"), waits, "{}", row(1));
+            assert_eq!(row(2).contains('╌'), waits, "{}", row(2));
+            assert_eq!(row(0).contains("· fine"), waits, "the lock: {}", row(0));
+        }
+    }
+
     #[test]
     fn the_log_notch_spends_its_cells_where_the_ear_hears_them() {
         let knob = |value| Knob {
@@ -908,6 +992,7 @@ mod tests {
             default: value,
             optional: false,
             log: true,
+            waits: false,
         };
         // Half the rail is the geometric mean, and an octave is the same
         // share of it anywhere in the range, where a linear rail gives an

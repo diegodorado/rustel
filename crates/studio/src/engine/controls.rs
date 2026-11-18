@@ -1,6 +1,16 @@
 use super::*;
 
 impl StudioEngine {
+    /// The numbers of `source` that its evaluations make live, each a
+    /// slider of the layout: see [`rustel_runtime::Session::set_live_numbers`].
+    pub fn set_live_numbers(
+        &mut self,
+        source: &str,
+        numbers: Vec<rustel_runtime::ui_events::LiveNumber>,
+    ) {
+        self.session.set_live_numbers(source, numbers);
+    }
+
     /// Move one of the running score's sliders.
     ///
     /// The cell the pattern reads is updated in place and the active graph

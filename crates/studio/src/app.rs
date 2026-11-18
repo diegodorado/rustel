@@ -25,7 +25,8 @@
 //! | sets and the set panel (^B) | `sets.rs` |
 //! | tapes, the replay tab and timeline | `replay_tabs.rs`, `replay_edit.rs`, `replay_pointer.rs`, `sessions.rs` |
 //! | inline sliders in the score | `slider.rs`, `slider_precision.rs` |
-//! | the knobs column beside the score | `knobs.rs` |
+//! | fine, relative drags of every slider rail | `fine_drag.rs` |
+//! | the knobs column beside the score, and the numbers it moves live | `knobs.rs`, `live_numbers.rs` |
 //! | the visuals docks | `viz_panel.rs` |
 //! | Hydra visuals behind the score | `hydra_backdrop.rs`, `stage_pixels.rs` |
 //! | split panes, scrollbars, minimap, zen, wrap | `panes.rs` |
@@ -164,6 +165,7 @@ mod event_loop;
 mod export_sheet;
 mod external_changes;
 mod find;
+mod fine_drag;
 mod focus;
 mod hydra_backdrop;
 #[cfg(feature = "hydra")]
@@ -174,6 +176,7 @@ mod keyboard;
 mod knobs;
 mod link;
 mod list_keys;
+mod live_numbers;
 mod loading_line;
 mod log_panel;
 mod memory_panel;
@@ -224,7 +227,7 @@ mod viz_panel;
 mod vst;
 
 use bank_context::bank_machines_ranked;
-use completion::{Landing, ReferenceAnchor};
+use completion::{Landing, LinkPlace, ReferenceAnchor};
 use controllers::StickRun;
 use device_picker::{ACTIVITY_LIGHT_MILLIS, INPUT_LIGHT_PEAK};
 use editing::edits_document;
@@ -1259,6 +1262,11 @@ struct App {
     /// stack up faster than the music absorbs them, and it is audible.
     installed_revision: Option<String>,
     inflight: HashMap<u64, PendingEvaluation>,
+    /// Generation the engine installed whose layout has not landed yet.
+    /// Until it lands, `evaluated_source` names the score before it.
+    layout_due: Option<u64>,
+    /// Generation of the last layout that landed.
+    layout_generation: Option<u64>,
     /// The text the footer's update message is about: the scene and the
     /// revision the engine refused. Once that text has changed and the
     /// checker finds it fine, the message comes down without waiting for
@@ -1461,6 +1469,8 @@ struct App {
     /// terminal that reports pixels sets it; one that reports cells leaves
     /// it at 0.
     pointer_subcell: f64,
+    /// Fine drags: held Shift or Alt, the fine lock, and a drag's grip.
+    fine_drag: fine_drag::FineDrag,
     /// The same fraction down a cell, for the controls that stand up.
     ///
     /// A slider lies along its row and needs only the horizontal fraction.
@@ -1589,6 +1599,9 @@ struct App {
     /// What each scene's current text holds, control-wise; see
     /// [`LiveSliderSet`].
     live_sliders: HashMap<SceneId, LiveSliderSet>,
+    /// The plain numbers of each scene the knobs column made live; see
+    /// [`live_numbers::LiveNumberSet`].
+    live_numbers: HashMap<SceneId, live_numbers::LiveNumberSet>,
 }
 
 impl App {
@@ -1865,6 +1878,8 @@ impl App {
             audible_scene,
             evaluation_revisions,
             installed_revision: None,
+            layout_due: None,
+            layout_generation: None,
             inflight: HashMap::new(),
             update_failure: None,
             blocked_imports: Vec::new(),
@@ -1959,6 +1974,7 @@ impl App {
             regions: StudioRegions::default(),
             pointer: None,
             pointer_subcell: 0.0,
+            fine_drag: fine_drag::FineDrag::default(),
             pointer_subrow: 0.0,
             last_pty_cell_pixels: None,
             focus: Focus::Editor,
@@ -2005,6 +2021,7 @@ impl App {
             sliders: Vec::new(),
             sliders_revision: None,
             live_sliders: HashMap::new(),
+            live_numbers: HashMap::new(),
         };
         // The reference leaves out what the settings hide from the first
         // frame, before a terminal is adopted.
@@ -2328,6 +2345,7 @@ impl App {
         self.scene_visits.retain(|visited| *visited != id);
         self.lint.remove(&id);
         self.live_sliders.remove(&id);
+        self.live_numbers.remove(&id);
         self.readiness.remove(&id);
         self.tabs_closed += 1;
         self.closed_documents.push(id.0);

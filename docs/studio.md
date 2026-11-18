@@ -593,8 +593,10 @@ Type to search the plugins by name. In the view of a half, the search finds
 its rows: parameters by name, title or group, presets by name. Enter on a
 plugin writes
 `.vst("name")` for an effect and `.vsti("name")` for an instrument at the
-caret. Enter on a parameter writes the parameter with its default, and Enter
-on a preset writes `preset: "name"`.
+caret. With the caret in the arguments of a call, the new call goes after
+that call's `)`, not inside it. An empty `.vst(` takes the name only. A call
+with no `)` yet must be closed first. Enter on a parameter writes the
+parameter with its default, and Enter on a preset writes `preset: "name"`.
 
 F12 enables Piano mode. Use it to enter notes from the keyboard. Leave Piano
 mode before you use those keys to edit ordinary text.
@@ -679,12 +681,34 @@ Options objects belong to calls that take them, such as
 audio control such as `lpf` takes a number: `lpf(800)` has a rail, and
 `lpf({ cutoff: 800 })` has none, because the engine refuses that note.
 
-A rail writes the score in place as you move it. While the set plays and
-auto evaluate is on, the change sounds at once, the way a score's own
-slider sounds. A stopped set, or auto evaluate off, keeps the typing pause.
-If the score already holds a `slider(value, min, max, step)`, the rail moves
-its value argument and keeps the call. The score is the master. The column
-only edits what is written.
+A rail writes the score in place as you move it. If the score already holds
+a `slider(value, min, max, step)`, the rail moves its value argument and
+keeps the call, and the change sounds at once. The score is the master. The
+column only edits what is written.
+
+A plain number that the engine reads as a pattern also sounds at once while
+the set plays, with no update and with auto evaluate on or off. That is the
+number of an audio control, such as the `4000` of `lpf(4000)`, and each
+number of a function such as `pg(0.8)`, `fast(2)` or `seg(4)`, and the
+distortion of an `FX` waveshaper such as `soft(4.5)`, and each entry of
+a plugin's options, such as the `0.111` of `vsti("Diva", { output: 0.111 })`.
+The first move installs the playing score again, unchanged, with that
+number live. Edits you have not evaluated stay out of the sound. After that
+each move sets the number, as a slider does. Any other number in an options
+object, a number in the other places of a plugin call, or a number of a
+function defined in the score sounds at once while the set plays and auto
+evaluate is on, with the next update. A stopped set, or auto evaluate off,
+keeps the typing pause. While the set plays, a plugin key that a rail
+turns on sounds at once, as an update of its own, when no other edit waits
+for an update.
+
+While the set plays and auto evaluate is off, a rail that the next update
+must carry is muted, on a dashed rail, with "not live" beside its value.
+Its hint says "plays after an update", or "⌫ off · plays on update" for an
+entry with an off stop. That is a number the playing score
+does not hold yet, such as the `8` of a `seg(8)` you typed and did not
+evaluate, or a number no live cell can stand in for. The move still writes
+the score.
 
 A number with no `slider(...)` gets bounds the studio works out:
 
@@ -715,6 +739,17 @@ Shift+→ move one step. A drag lands on a whole number when the cell or the
 pixel under the pointer holds one that the rail's steps reach. It holds the
 rail it started on: the pointer can leave the column, and the rail follows
 it until you let go.
+
+Hold Shift or Alt while you drag any slider for a fine drag: a rail of the
+column, a score slider, the expanded slider or a desk fader. The value
+stops jumping to the pointer and moves a tenth as far as the pointer, from
+where you took hold. Let go of the key and the drag goes on at full speed
+from there, with no jump. Some terminals keep a Shift or Alt drag for their
+own text selection. Press f in the column or in the expanded slider to lock
+fine drags on, and f again to turn the lock off. The column's title says
+"fine" while the lock is on, and the status line says "fine" during a fine
+drag. A press on the off stop still turns the rail off. A fine drag that
+took hold moves past it to the rail's minimum.
 
 The far left of a rail is an off stop. On an object entry it takes the entry
 out of the score and leaves its comments where they are. Backspace or

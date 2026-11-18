@@ -409,6 +409,7 @@ fn make_knob(label: String, place: KnobPlace, state: KnobState) -> Knob {
         step: 0.01,
         default: 0.0,
         log: false,
+        waits: false,
     }
 }
 
@@ -953,6 +954,7 @@ impl App {
             }
         }
         self.assemble_knobs();
+        self.mark_waiting_knobs();
         // The presets of the plugin call, read for the section under the
         // rails: a new call asks for its own names, and a new read of the
         // preset folders brings them again. The names stay empty for a
@@ -1162,6 +1164,7 @@ impl App {
                         default: defaults.default,
                         optional: true,
                         log: false,
+                        waits: false,
                     },
                     &mut knobs,
                 );
@@ -1230,6 +1233,7 @@ impl App {
                     default: option.start().clamp(min, max),
                     optional: true,
                     log: false,
+                    waits: false,
                 });
             }
             knobs.sort_by_key(|knob| {
@@ -1379,7 +1383,7 @@ impl App {
                     | KeyCode::End
                     | KeyCode::Delete
                     | KeyCode::Backspace
-                    | KeyCode::Char('e' | 'E' | 'a' | 'A' | 'r' | 'R')
+                    | KeyCode::Char('e' | 'E' | 'a' | 'A' | 'r' | 'R' | 'f' | 'F')
             )
         };
         // Any key but a second `r` keeps the rails a first `r` offered to
@@ -1413,6 +1417,7 @@ impl App {
                 KeyCode::Char('e' | 'E') | KeyCode::Enter => self.open_knobs_form(),
                 KeyCode::Char('a' | 'A') => self.open_knobs_add(),
                 KeyCode::Char('r' | 'R') => self.knobs_reset_key(),
+                KeyCode::Char('f' | 'F') => self.toggle_fine_lock(),
                 KeyCode::Delete | KeyCode::Backspace => self.knobs_delete(),
                 KeyCode::Left => self.nudge_knob(-1, shift),
                 KeyCode::Right => self.nudge_knob(1, shift),
@@ -2195,8 +2200,13 @@ impl App {
     /// Say what a move did, the way the inline sliders do: the value and
     /// the step, so the next move is a known quantity.
     fn knob_status(&mut self, knob: &Knob, value: f64) {
+        let waits = if knob.waits {
+            " · plays after an update"
+        } else {
+            ""
+        };
         self.status = format!(
-            "knobs: {} {} · step {}",
+            "knobs: {} {} · step {}{waits}",
             knob.label,
             short_number(value),
             short_number(knob.step)
@@ -2206,8 +2216,9 @@ impl App {
 
     /// Set a rail's value: through the live control when the score holds
     /// a fader there - the engine hears it without a re-evaluation - or
-    /// as one control edit of the text, which the next update or auto
-    /// evaluate picks up.
+    /// through a live number when the rail is a control's own number and
+    /// the set plays, or else as one control edit of the text, which the
+    /// next update or auto evaluate picks up.
     fn set_knob(&mut self, knob: &Knob, value: f64) -> bool {
         let scene = self.scenes.current().id;
         let value = value.clamp(knob.min, knob.max);
@@ -2236,7 +2247,98 @@ impl App {
         if unchanged {
             return true;
         }
+        if self.knob_may_move_live(knob)
+            && let Some(held) = self.knob_live_held(knob, &self.editor().source())
+            && self.move_live_number(held, literal.clone(), value, &text)
+        {
+            return true;
+        }
         self.knobs_write(literal, &text)
+    }
+
+    /// Mark the rails a move of which waits for the next update while the
+    /// set plays: a number the playing score does not hold yet, such as a
+    /// call typed since, or holds where no live cell can stand. With auto
+    /// evaluate on, every move is an update, so none waits.
+    fn mark_waiting_knobs(&mut self) {
+        let scene = self.scenes.current().id;
+        if self.ui_settings.auto_evaluate || !self.plays_live(scene) {
+            return;
+        }
+        let Some(rows) = self.knobs_rows.as_ref() else {
+            return;
+        };
+        let chips = self.live_chips(scene);
+        // One copy of the text for every rail of the frame.
+        let source = self.editor().source();
+        let waits: Vec<bool> = rows
+            .knobs
+            .iter()
+            .map(|knob| {
+                let Some(state) = knob.state.as_ref() else {
+                    return false;
+                };
+                let literal = state.literal.clone();
+                let fader = chips
+                    .iter()
+                    .any(|chip| chip.span.from <= literal.start && literal.end <= chip.span.to);
+                let moves_live = self
+                    .knob_live_held(knob, &source)
+                    .is_some_and(|held| self.number_moves_live(scene, &source, held, literal));
+                !fader && !moves_live
+            })
+            .collect();
+        if let Some(rows) = self.knobs_rows.as_mut() {
+            for (knob, waits) in rows.knobs.iter_mut().zip(waits) {
+                knob.waits = waits;
+            }
+        }
+    }
+
+    /// What a live move of the rail needs before the score's text is read:
+    /// a plain number, no fader, of a call that takes a live cell there.
+    /// A plugin reads each entry of its options object as a pattern, so
+    /// a cell there drives the parameter.
+    fn knob_may_move_live(&self, knob: &Knob) -> bool {
+        knob.state
+            .as_ref()
+            .is_some_and(|state| state.fader.is_none())
+            && self
+                .knobs_parse
+                .as_ref()
+                .and_then(|parse| parse.call.as_ref())
+                .is_some_and(|call| match knob.place {
+                    KnobPlace::Argument(at) => {
+                        call.plugin.is_none()
+                            && super::live_numbers::takes_a_live_number(
+                                &call.name,
+                                call.control,
+                                at,
+                            )
+                    }
+                    KnobPlace::Entry(_) => call.plugin.is_some(),
+                })
+    }
+
+    /// The bytes of `source`, the current score, that a live move of the
+    /// rail's number relies on - from the call's name to the number - when
+    /// a live cell can stand in for that number: see
+    /// [`super::live_numbers::takes_a_live_number`]. While the playing
+    /// score holds those bytes as they are, its number there is the one the
+    /// rail moves. An entry of an options object is read as it is written,
+    /// so a cell there would not be a number, unless a plugin reads it.
+    fn knob_live_held(&self, knob: &Knob, source: &str) -> Option<Range<usize>> {
+        if !self.knob_may_move_live(knob) {
+            return None;
+        }
+        let literal = &knob.state.as_ref()?.literal;
+        let call = self.knobs_parse.as_ref()?.call.as_ref()?;
+        if super::live_numbers::defined_in(source, &call.name) {
+            return None;
+        }
+        let before = source.get(..call.open)?.trim_end();
+        let start = before.strip_suffix(call.name.as_str())?.len();
+        (start <= literal.start).then_some(start..literal.end)
     }
 
     /// A rail's value as the score writes it: a plugin parameter to three
@@ -2298,6 +2400,9 @@ impl App {
         let Some(entry) = cuts.iter().position(|cut| cut.contains(&literal.start)) else {
             return;
         };
+        let playing = self
+            .knob_live_held(knob, &source)
+            .and_then(|held| self.playing_number(&source, held, literal.clone()));
         let held_text = HeldText {
             after: String::new(),
             literal: literal.start - cuts[entry].start..literal.end - cuts[entry].start,
@@ -2330,6 +2435,7 @@ impl App {
                 knob: held,
                 fader,
                 text: after.map(|after| HeldText { after, ..held_text }),
+                playing,
             });
         }
         // The rows answer at once, the rail held off at its row.
@@ -2355,6 +2461,9 @@ impl App {
             return false;
         };
         let source = self.editor().source();
+        // Before the write: the playing score is this text but for the
+        // numbers rails moved live.
+        let clean = self.plays_but_live_moves(&source);
         let held = self.knobs_panel.as_ref().and_then(|panel| {
             panel
                 .off
@@ -2430,6 +2539,7 @@ impl App {
         // The written entry lands inside the object, and the hand keeps
         // the rail it just turned back on.
         self.refresh_knobs(Rect::default());
+        let mut back = None;
         if let Some(rows) = self.knobs_rows.as_ref()
             // Two entries can share a name. The score reads the last,
             // so the last is the one the hand keeps.
@@ -2437,6 +2547,31 @@ impl App {
             && let Some(panel) = self.knobs_panel.as_mut()
         {
             panel.selected = at;
+            // With the key twice, which entry came back is not known.
+            let alone = rows
+                .knobs
+                .iter()
+                .filter(|row| row.place == knob.place)
+                .count()
+                == 1;
+            back = alone.then(|| rows.knobs[at].clone());
+        }
+        let literal = back
+            .as_ref()
+            .filter(|row| self.knob_may_move_live(row))
+            .and_then(|row| row.state.as_ref())
+            .map(|state| state.literal.clone());
+        if let Some(literal) = literal {
+            // The playing score still holds the number: it moves live
+            // again. A score that played the text as it was takes the
+            // entry as an update of its own, with the number live.
+            let live = match held.and_then(|held| held.playing) {
+                Some(playing) => self.relive_number(playing, literal.clone(), value),
+                None => false,
+            };
+            if !live {
+                self.update_with_new_number(clean, literal);
+            }
         }
         self.status = format!("knobs: {} on at {}", knob.label, short_number(value));
         self.dirty_frame = true;
@@ -2504,11 +2639,21 @@ impl App {
     /// [`Self::knobs_write`] for edits that land together: ranges of the
     /// score as it stands, none overlapping, as one undo step.
     fn knobs_edit(&mut self, edits: Vec<(Range<usize>, String)>) -> bool {
+        if self.control_edit(edits).is_none() {
+            return false;
+        }
+        self.auto_evaluate_due = false;
+        self.auto_evaluate();
+        true
+    }
+
+    /// The panel's edits as one control edit of the current score, with
+    /// none of the update an edit owes: the revision they applied on, or
+    /// `None` when the editor refused them.
+    pub(super) fn control_edit(&mut self, edits: Vec<(Range<usize>, String)>) -> Option<Revision> {
         let scene = self.scenes.current().id;
         let moment = self.moment();
-        let Some(entry) = self.scenes.get_mut(scene) else {
-            return false;
-        };
+        let entry = self.scenes.get_mut(scene)?;
         let viewport = entry.editor.viewport();
         let before = entry.editor.revision();
         let transaction = edits.into_iter().fold(
@@ -2527,15 +2672,13 @@ impl App {
             }
             Err(error) => {
                 self.set_error(ErrorOwner::Editor, error.to_string());
-                return false;
+                return None;
             }
         }
         self.after_edit(scene, before, false);
-        self.auto_evaluate_due = false;
-        self.auto_evaluate();
         self.knobs_parse = None;
         self.dirty_frame = true;
-        true
+        Some(before)
     }
 
     /// A press on the panel: a rail sets its value where it is clicked,
@@ -2667,7 +2810,9 @@ impl App {
         if rail.width < 3 {
             return;
         }
-        if knob.optional && x <= rail.x {
+        // The off stop is a place on the rail: the press finds it, a
+        // relative drag already holding a grip moves past it.
+        if knob.optional && x <= rail.x && !self.fine_drag.gripped() {
             if knob.state.is_some() {
                 self.knob_off(&knob);
             }
@@ -2685,19 +2830,16 @@ impl App {
                 width: rail.width,
             }
         };
-        let cell_width = self
-            .features
-            .pixel_mouse
-            .then_some(self.features.cell_pixels)
-            .flatten()
-            .map(|(width, _)| width);
-        let ratio = track.ratio(x, self.pointer_subcell, cell_width);
         let travel = if knob.log {
             Travel::Logarithmic
         } else {
             Travel::Linear
         };
-        let resolution = track.resolution(cell_width);
+        let now = knob
+            .state
+            .as_ref()
+            .map_or(0.0, |state| travel.ratio(state.value, knob.min, knob.max));
+        let (ratio, resolution) = self.rail_drag(track, x, now);
         let value = pointer_value(travel, ratio, resolution, knob.min, knob.max, knob.step);
         if knob.state.is_none() {
             self.knob_on(&knob, value);
@@ -2705,6 +2847,8 @@ impl App {
         }
         self.set_knob(&knob, value);
         self.knob_status(&knob, value);
+        let hint = self.fine_drag_hint();
+        self.status.push_str(&hint);
     }
 
     /// The wheel over the panel walks its rails.
@@ -2788,6 +2932,7 @@ fn forget_param(chosen: &mut Vec<String>, key: &str) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -2884,6 +3029,7 @@ mod tests {
             default: 800.0,
             optional: true,
             log: false,
+            waits: false,
         };
         let param = ParamDefaults {
             default: 0.25,
@@ -3456,6 +3602,147 @@ mod tests {
             default_text: String::new(),
             role: ParamRole::Plain,
         }
+    }
+
+    /// A plugin key turned on in a playing call that lacked it, with no
+    /// other edit since the update, goes in as an update of its own with
+    /// the number live, so the next moves sound with no evaluation.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_plugin_key_turned_on_goes_live_with_its_own_update() {
+        use super::super::tests::support::sounding;
+        use rustel_runtime::ui_events::source_revision;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let score = "$: s(\"bd\").vst(\"FX\", { })\n";
+        let mut app = plugin_app(
+            directory.path(),
+            score,
+            vec![plugin_param("gain", 0), plugin_param("mix", 0)],
+        );
+        app.ui_settings.auto_evaluate = false;
+        let scene = app.scenes.current().id;
+        app.evaluation_revisions.remember(
+            source_revision(score),
+            app.editor().revision(),
+            score.into(),
+            scene,
+            None,
+        );
+        let layout = rustel_runtime::ui_events::visual_layout(score, 1).expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        app.snapshot = Some(sounding(true, false));
+        app.refresh_knobs(Rect::default());
+        let at = app
+            .knobs_rows
+            .as_ref()
+            .and_then(|rows| rows.knobs.iter().position(|knob| knob.label == "gain"))
+            .expect("the gain rail, off");
+        app.drag_knob(at, Rect::new(0, 0, 24, 1), 12);
+        let source = app.editor().source();
+        assert!(source.contains("gain: "), "on: {source}");
+        let sent: Vec<_> = app
+            .inflight
+            .values()
+            .map(|pending| pending.source.to_string())
+            .chain(
+                app.pending_evaluation
+                    .as_ref()
+                    .map(|pending| pending.source.to_string()),
+            )
+            .collect();
+        assert_eq!(
+            sent,
+            std::slice::from_ref(&source),
+            "the update carries the new entry"
+        );
+
+        // The update lands with gain live, and gain moves live. A second
+        // key turned on still goes in at once: a live move is no edit.
+        app.inflight.clear();
+        app.pending_evaluation = None;
+        let gain = source.find("0.").expect("the gain");
+        let cell = gain..gain + source[gain..].find([' ', ',', '}']).expect("its end");
+        let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+            &source,
+            2,
+            &[rustel_runtime::ui_events::LiveNumber {
+                literal: cell,
+                value: None,
+            }],
+        )
+        .expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        // The host knows no such plugin here: each new text is told again.
+        let known = |app: &mut App| {
+            app.refresh_knobs(Rect::default());
+            if let Some(parse) = app.knobs_parse.as_mut() {
+                parse.params = Some(vec![plugin_param("gain", 0), plugin_param("mix", 0)]);
+            }
+            app.refresh_knobs(Rect::default());
+        };
+        known(&mut app);
+        let row = |app: &App, label: &str| {
+            app.knobs_rows
+                .as_ref()
+                .and_then(|rows| rows.knobs.iter().position(|knob| knob.label == label))
+                .expect("the rail")
+        };
+        let at = row(&app, "gain");
+        app.drag_knob(at, Rect::new(0, 0, 24, 1), 18);
+        assert!(app.inflight.is_empty() && app.pending_evaluation.is_none());
+        assert_ne!(app.editor().source(), source, "the move wrote");
+        assert!(app.plays_but_live_moves(&app.editor().source()));
+        // A digit typed into the live number is an edit that waits.
+        let typed = |app: &mut App, text: &str, at: usize, to: usize| {
+            app.editor_mut()
+                .dispatch(
+                    crate::editor::Command::ReplaceRange {
+                        from: crate::editor::ByteOffset(at),
+                        to: crate::editor::ByteOffset(to),
+                        text: text.into(),
+                    },
+                    crate::editor::HistoryMoment(9),
+                    &mut crate::editor::MemoryClipboard::default(),
+                )
+                .expect("the typed edit");
+        };
+        let digit = app.editor().source().find("gain: 0.").expect("the gain") + "gain: 0.".len();
+        typed(&mut app, "0", digit, digit);
+        assert!(!app.plays_but_live_moves(&app.editor().source()));
+        typed(&mut app, "", digit, digit + 1);
+        known(&mut app);
+        let mix = row(&app, "mix");
+        app.drag_knob(mix, Rect::new(0, 0, 24, 1), 12);
+        let source = app.editor().source();
+        assert!(source.contains("mix: "), "on: {source}");
+        assert_eq!(
+            app.pending_evaluation
+                .as_ref()
+                .map(|pending| pending.source.to_string())
+                .or_else(|| app.inflight.values().next().map(|p| p.source.to_string())),
+            Some(source),
+            "the second key goes in at once"
+        );
+
+        // Another edit waiting keeps the new key for the next update.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = plugin_app(directory.path(), score, vec![plugin_param("gain", 0)]);
+        app.ui_settings.auto_evaluate = false;
+        let scene = app.scenes.current().id;
+        let played = "$: s(\"hh\").vst(\"FX\", { })\n";
+        app.evaluation_revisions.remember(
+            source_revision(played),
+            app.editor().revision(),
+            played.into(),
+            scene,
+            None,
+        );
+        let layout = rustel_runtime::ui_events::visual_layout(played, 1).expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        app.snapshot = Some(sounding(true, false));
+        app.refresh_knobs(Rect::default());
+        app.drag_knob(at, Rect::new(0, 0, 24, 1), 12);
+        assert!(app.inflight.is_empty() && app.pending_evaluation.is_none());
     }
 
     /// The add list is wider than the column and as tall as it. It scrolls
