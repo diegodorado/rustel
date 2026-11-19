@@ -1145,13 +1145,18 @@ impl App {
                     self.add_sample_source(&spec);
                 }
                 SetPrompt::EditSampleSource(at) => {
-                    let spec = path.to_string_lossy().trim().to_owned();
+                    let spec =
+                        super::sample_import::normalized_sample_source(&path.to_string_lossy());
                     self.return_from_source_prompt();
                     if self.refuse_set_output_source(&spec) {
                         return true;
                     }
-                    if let Some(source) = self.prefs.sample_sources.get_mut(at) {
-                        source.spec = spec.clone();
+                    // One row per source, as add keeps it.
+                    if self.prefs.edit_folds_sources(at, &spec) {
+                        self.status = format!("{spec} overlaps another sample source");
+                        return true;
+                    }
+                    if self.prefs.change_sample_source(at, spec.clone()) {
                         self.save_prefs_soon();
                         self.adopt_global_sources();
                         self.status = format!("sample source changed to {spec}");
